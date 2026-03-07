@@ -1,22 +1,58 @@
 import { supabase } from './supabase';
 
-// Google API base URLs
-const CALENDAR_API = 'https://www.googleapis.com/calendar/v3';
-const TASKS_API = 'https://www.googleapis.com/tasks/v1';
+// Store Google tokens in memory + localStorage for persistence across page loads
+// (Supabase only provides provider_token immediately after OAuth, not on refresh)
+let cachedToken: string | null = null;
+let cachedRefreshToken: string | null = null;
 
-// Check if user has Google connected
+// Initialize from localStorage on load
+if (typeof window !== 'undefined') {
+  cachedToken = localStorage.getItem('google_access_token');
+  cachedRefreshToken = localStorage.getItem('google_refresh_token');
+}
+
+// Listen for auth state changes to capture Google tokens
+if (typeof window !== 'undefined') {
+  supabase.auth.onAuthStateChange((_event, session) => {
+    if (session?.provider_token) {
+      cachedToken = session.provider_token;
+      localStorage.setItem('google_access_token', session.provider_token);
+    }
+    if ((session as any)?.provider_refresh_token) {
+      cachedRefreshToken = (session as any).provider_refresh_token;
+      localStorage.setItem('google_refresh_token', (session as any).provider_refresh_token);
+    }
+  });
+}
+
+// === Core auth functions ===
+
 export async function isGoogleConnected(): Promise<boolean> {
+  if (cachedToken) return true;
   const { data: { session } } = await supabase.auth.getSession();
-  return !!session?.provider_token;
+  if (session?.provider_token) {
+    cachedToken = session.provider_token;
+    localStorage.setItem('google_access_token', session.provider_token);
+    return true;
+  }
+  // Check localStorage as fallback
+  return !!localStorage.getItem('google_access_token');
 }
 
-// Get the Google access token from Supabase session
 export async function getGoogleToken(): Promise<string | null> {
+  if (cachedToken) return cachedToken;
   const { data: { session } } = await supabase.auth.getSession();
-  return session?.provider_token || null;
+  if (session?.provider_token) {
+    cachedToken = session.provider_token;
+    localStorage.setItem('google_access_token', session.provider_token);
+    return session.provider_token;
+  }
+  return localStorage.getItem('google_access_token');
 }
 
-// Sign in with Google via Supabase (requests calendar + tasks scopes)
+// Backward compatibility alias used by googleCalendar.ts and googleTasks.ts
+export const getValidAccessToken = getGoogleToken;
+
 export async function connectGoogle(): Promise<void> {
   const { error } = await supabase.auth.signInWithOAuth({
     provider: 'google',
@@ -35,151 +71,29 @@ export async function connectGoogle(): Promise<void> {
   }
 }
 
-// Disconnect Google
+// Backward compatibility alias used by GoogleConnect.tsx and CalendarView.tsx
+export const initiateGoogleAuth = connectGoogle;
+
+// Backward compatibility - called by App.tsx after OAuth redirect
+// With Supabase auth, the callback is handled automatically via onAuthStateChange
+export async function handleAuthCallback(_code?: string): Promise<boolean> {
+  const { data: { session } } = await supabase.auth.getSession();
+  if (session?.provider_token) {
+    cachedToken = session.provider_token;
+    localStorage.setItem('google_access_token', session.provider_token);
+    if ((session as any)?.provider_refresh_token) {
+      cachedRefreshToken = (session as any).provider_refresh_token;
+      localStorage.setItem('google_refresh_token', (session as any).provider_refresh_token);
+    }
+    return true;
+  }
+  return !!localStorage.getItem('google_access_token');
+}
+
 export async function disconnectGoogle(): Promise<void> {
+  cachedToken = null;
+  cachedRefreshToken = null;
+  localStorage.removeItem('google_access_token');
+  localStorage.removeItem('google_refresh_token');
   await supabase.auth.signOut();
-}
-
-// --- Google Calendar API ---
-
-export async function fetchCalendarEvents(
-  timeMin: string,
-  timeMax: string,
-  calendarId: string = 'primary'
-): Promise<any[]> {
-  const token = await getGoogleToken();
-  if (!token) return [];
-
-  try {
-    const params = new URLSearchParams({
-      timeMin,
-      timeMax,
-      singleEvents: 'true',
-      orderBy: 'startTime',
-      maxResults: '100',
-    });
-
-    const res = await fetch(
-      `${CALENDAR_API}/calendars/${encodeURIComponent(calendarId)}/events?${params}`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-
-    if (!res.ok) {
-      console.error('Calendar API error:', res.status);
-      return [];
-    }
-
-    const data = await res.json();
-    return data.items || [];
-  } catch (err) {
-    console.error('Failed to fetch calendar events:', err);
-    return [];
-  }
-}
-
-export async function createCalendarEvent(
-  title: string,
-  start: string,
-  end: string,
-  calendarId: string = 'primary'
-): Promise<any> {
-  const token = await getGoogleToken();
-  if (!token) throw new Error('Not connected to Google');
-
-  const res = await fetch(
-    `${CALENDAR_API}/calendars/${encodeURIComponent(calendarId)}/events`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        summary: title,
-        start: { dateTime: start },
-        end: { dateTime: end },
-      }),
-    }
-  );
-
-  if (!res.ok) throw new Error(`Calendar API error: ${res.status}`);
-  return res.json();
-}
-
-// --- Google Tasks API ---
-
-export async function fetchTaskLists(): Promise<any[]> {
-  const token = await getGoogleToken();
-  if (!token) return [];
-
-  try {
-    const res = await fetch(`${TASKS_API}/users/@me/lists`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!res.ok) return [];
-    const data = await res.json();
-    return data.items || [];
-  } catch (err) {
-    console.error('Failed to fetch task lists:', err);
-    return [];
-  }
-}
-
-export async function fetchGoogleTasks(taskListId: string): Promise<any[]> {
-  const token = await getGoogleToken();
-  if (!token) return [];
-
-  try {
-    const res = await fetch(
-      `${TASKS_API}/lists/${taskListId}/tasks?showCompleted=false&maxResults=100`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    if (!res.ok) return [];
-    const data = await res.json();
-    return data.items || [];
-  } catch (err) {
-    console.error('Failed to fetch tasks:', err);
-    return [];
-  }
-}
-
-export async function createGoogleTask(
-  taskListId: string,
-  title: string,
-  notes?: string,
-  due?: string
-): Promise<any> {
-  const token = await getGoogleToken();
-  if (!token) throw new Error('Not connected to Google');
-
-  const body: any = { title };
-  if (notes) body.notes = notes;
-  if (due) body.due = due;
-
-  const res = await fetch(`${TASKS_API}/lists/${taskListId}/tasks`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) throw new Error(`Tasks API error: ${res.status}`);
-  return res.json();
-}
-
-export async function deleteGoogleTask(
-  taskListId: string,
-  taskId: string
-): Promise<void> {
-  const token = await getGoogleToken();
-  if (!token) throw new Error('Not connected to Google');
-
-  const res = await fetch(`${TASKS_API}/lists/${taskListId}/tasks/${taskId}`, {
-    method: 'DELETE',
-    headers: { Authorization: `Bearer ${token}` },
-  });
-
-  if (!res.ok) throw new Error(`Tasks API error: ${res.status}`);
 }
