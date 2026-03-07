@@ -1,143 +1,185 @@
 import { supabase } from './supabase';
 
-// Only the Client ID is needed in the browser — it's public/safe
-const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID as string;
-const REDIRECT_URI = `${window.location.origin}/auth/callback`;
+// Google API base URLs
+const CALENDAR_API = 'https://www.googleapis.com/calendar/v3';
+const TASKS_API = 'https://www.googleapis.com/tasks/v1';
 
-const SCOPES = [
-  'https://www.googleapis.com/auth/calendar',
-  'https://www.googleapis.com/auth/calendar.readonly',
-  'https://www.googleapis.com/auth/tasks',
-  'https://www.googleapis.com/auth/tasks.readonly',
-].join(' ');
-
-/** Redirect user to Google OAuth consent screen */
-export function initiateGoogleAuth() {
-  const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
-  authUrl.searchParams.set('client_id', GOOGLE_CLIENT_ID);
-  authUrl.searchParams.set('redirect_uri', REDIRECT_URI);
-  authUrl.searchParams.set('response_type', 'code');
-  authUrl.searchParams.set('scope', SCOPES);
-  authUrl.searchParams.set('access_type', 'offline');
-  authUrl.searchParams.set('prompt', 'consent');
-  window.location.href = authUrl.toString();
-}
-
-/** Exchange auth code for tokens via our secure server API */
-export async function handleAuthCallback(code: string): Promise<boolean> {
-  try {
-    // Send the code to our Vercel API route (secret stays on server)
-    const response = await fetch('/api/google-auth', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'exchange',
-        code,
-        redirectUri: REDIRECT_URI,
-      }),
-    });
-
-    const tokens = await response.json();
-    if (tokens.error) {
-      console.error('Token exchange failed:', tokens.error_description || tokens.error);
-      return false;
-    }
-
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return false;
-
-    // Store tokens in Supabase
-    const { error } = await supabase.from('google_tokens').upsert({
-      user_id: user.id,
-      access_token: tokens.access_token,
-      refresh_token: tokens.refresh_token,
-      expires_at: new Date(Date.now() + tokens.expires_in * 1000).toISOString(),
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'user_id' });
-
-    if (error) {
-      console.error('Failed to store tokens:', error.message);
-      return false;
-    }
-
-    return true;
-  } catch (err) {
-    console.error('OAuth callback error:', err);
-    return false;
-  }
-}
-
-/** Get a valid Google access token, refreshing if needed */
-export async function getValidAccessToken(): Promise<string | null> {
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return null;
-
-  const { data: tokenData } = await supabase
-    .from('google_tokens')
-    .select('*')
-    .eq('user_id', user.id)
-    .single();
-
-  if (!tokenData) return null;
-
-  // Check if token is still valid (with 5-minute buffer)
-  const expiresAt = new Date(tokenData.expires_at);
-  const bufferMs = 5 * 60 * 1000;
-
-  if (expiresAt.getTime() - bufferMs > Date.now()) {
-    return tokenData.access_token;
-  }
-
-  // Token expired — refresh via our secure server API
-  if (!tokenData.refresh_token) return null;
-
-  try {
-    const response = await fetch('/api/google-auth', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'refresh',
-        refreshToken: tokenData.refresh_token,
-      }),
-    });
-
-    const newTokens = await response.json();
-    if (newTokens.error) {
-      console.error('Token refresh failed:', newTokens.error);
-      return null;
-    }
-
-    await supabase.from('google_tokens').update({
-      access_token: newTokens.access_token,
-      expires_at: new Date(Date.now() + newTokens.expires_in * 1000).toISOString(),
-      updated_at: new Date().toISOString(),
-    }).eq('user_id', user.id);
-
-    return newTokens.access_token;
-  } catch (err) {
-    console.error('Token refresh error:', err);
-    return null;
-  }
-}
-
-/** Check if Google is connected */
+// Check if user has Google connected
 export async function isGoogleConnected(): Promise<boolean> {
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return false;
-
-  const { data } = await supabase
-    .from('google_tokens')
-    .select('id')
-    .eq('user_id', user.id)
-    .single();
-
-  return !!data;
+  const { data: { session } } = await supabase.auth.getSession();
+  return !!session?.provider_token;
 }
 
-/** Disconnect Google account */
-export async function disconnectGoogle(): Promise<void> {
-  const { data: { user } } = await supabase.auth.getUser();
-  if (user) {
-    await supabase.from('google_tokens').delete().eq('user_id', user.id);
+// Get the Google access token from Supabase session
+export async function getGoogleToken(): Promise<string | null> {
+  const { data: { session } } = await supabase.auth.getSession();
+  return session?.provider_token || null;
+}
+
+// Sign in with Google via Supabase (requests calendar + tasks scopes)
+export async function connectGoogle(): Promise<void> {
+  const { error } = await supabase.auth.signInWithOAuth({
+    provider: 'google',
+    options: {
+      scopes: 'https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/tasks',
+      redirectTo: window.location.origin,
+      queryParams: {
+        access_type: 'offline',
+        prompt: 'consent',
+      },
+    },
+  });
+  if (error) {
+    console.error('Google sign-in error:', error);
+    throw error;
   }
+}
+
+// Disconnect Google
+export async function disconnectGoogle(): Promise<void> {
+  await supabase.auth.signOut();
+}
+
+// --- Google Calendar API ---
+
+export async function fetchCalendarEvents(
+  timeMin: string,
+  timeMax: string,
+  calendarId: string = 'primary'
+): Promise<any[]> {
+  const token = await getGoogleToken();
+  if (!token) return [];
+
+  try {
+    const params = new URLSearchParams({
+      timeMin,
+      timeMax,
+      singleEvents: 'true',
+      orderBy: 'startTime',
+      maxResults: '100',
+    });
+
+    const res = await fetch(
+      `${CALENDAR_API}/calendars/${encodeURIComponent(calendarId)}/events?${params}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    if (!res.ok) {
+      console.error('Calendar API error:', res.status);
+      return [];
+    }
+
+    const data = await res.json();
+    return data.items || [];
+  } catch (err) {
+    console.error('Failed to fetch calendar events:', err);
+    return [];
+  }
+}
+
+export async function createCalendarEvent(
+  title: string,
+  start: string,
+  end: string,
+  calendarId: string = 'primary'
+): Promise<any> {
+  const token = await getGoogleToken();
+  if (!token) throw new Error('Not connected to Google');
+
+  const res = await fetch(
+    `${CALENDAR_API}/calendars/${encodeURIComponent(calendarId)}/events`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        summary: title,
+        start: { dateTime: start },
+        end: { dateTime: end },
+      }),
+    }
+  );
+
+  if (!res.ok) throw new Error(`Calendar API error: ${res.status}`);
+  return res.json();
+}
+
+// --- Google Tasks API ---
+
+export async function fetchTaskLists(): Promise<any[]> {
+  const token = await getGoogleToken();
+  if (!token) return [];
+
+  try {
+    const res = await fetch(`${TASKS_API}/users/@me/lists`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.items || [];
+  } catch (err) {
+    console.error('Failed to fetch task lists:', err);
+    return [];
+  }
+}
+
+export async function fetchGoogleTasks(taskListId: string): Promise<any[]> {
+  const token = await getGoogleToken();
+  if (!token) return [];
+
+  try {
+    const res = await fetch(
+      `${TASKS_API}/lists/${taskListId}/tasks?showCompleted=false&maxResults=100`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.items || [];
+  } catch (err) {
+    console.error('Failed to fetch tasks:', err);
+    return [];
+  }
+}
+
+export async function createGoogleTask(
+  taskListId: string,
+  title: string,
+  notes?: string,
+  due?: string
+): Promise<any> {
+  const token = await getGoogleToken();
+  if (!token) throw new Error('Not connected to Google');
+
+  const body: any = { title };
+  if (notes) body.notes = notes;
+  if (due) body.due = due;
+
+  const res = await fetch(`${TASKS_API}/lists/${taskListId}/tasks`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) throw new Error(`Tasks API error: ${res.status}`);
+  return res.json();
+}
+
+export async function deleteGoogleTask(
+  taskListId: string,
+  taskId: string
+): Promise<void> {
+  const token = await getGoogleToken();
+  if (!token) throw new Error('Not connected to Google');
+
+  const res = await fetch(`${TASKS_API}/lists/${taskListId}/tasks/${taskId}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (!res.ok) throw new Error(`Tasks API error: ${res.status}`);
 }
