@@ -1,7 +1,7 @@
 import { supabase } from './supabase';
 
+// Only the Client ID is needed in the browser — it's public/safe
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID as string;
-const GOOGLE_CLIENT_SECRET = import.meta.env.VITE_GOOGLE_CLIENT_SECRET as string;
 const REDIRECT_URI = `${window.location.origin}/auth/callback`;
 
 const SCOPES = [
@@ -23,18 +23,17 @@ export function initiateGoogleAuth() {
   window.location.href = authUrl.toString();
 }
 
-/** Exchange auth code for tokens and store in Supabase */
+/** Exchange auth code for tokens via our secure server API */
 export async function handleAuthCallback(code: string): Promise<boolean> {
   try {
-    const response = await fetch('https://oauth2.googleapis.com/token', {
+    // Send the code to our Vercel API route (secret stays on server)
+    const response = await fetch('/api/google-auth', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'exchange',
         code,
-        client_id: GOOGLE_CLIENT_ID,
-        client_secret: GOOGLE_CLIENT_SECRET,
-        redirect_uri: REDIRECT_URI,
-        grant_type: 'authorization_code',
+        redirectUri: REDIRECT_URI,
       }),
     });
 
@@ -47,7 +46,7 @@ export async function handleAuthCallback(code: string): Promise<boolean> {
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return false;
 
-    // Upsert tokens into Supabase
+    // Store tokens in Supabase
     const { error } = await supabase.from('google_tokens').upsert({
       user_id: user.id,
       access_token: tokens.access_token,
@@ -81,7 +80,7 @@ export async function getValidAccessToken(): Promise<string | null> {
 
   if (!tokenData) return null;
 
-  // Check if token is expired (with 5-minute buffer)
+  // Check if token is still valid (with 5-minute buffer)
   const expiresAt = new Date(tokenData.expires_at);
   const bufferMs = 5 * 60 * 1000;
 
@@ -89,18 +88,16 @@ export async function getValidAccessToken(): Promise<string | null> {
     return tokenData.access_token;
   }
 
-  // Token expired — refresh it
+  // Token expired — refresh via our secure server API
   if (!tokenData.refresh_token) return null;
 
   try {
-    const response = await fetch('https://oauth2.googleapis.com/token', {
+    const response = await fetch('/api/google-auth', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        refresh_token: tokenData.refresh_token,
-        client_id: GOOGLE_CLIENT_ID,
-        client_secret: GOOGLE_CLIENT_SECRET,
-        grant_type: 'refresh_token',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'refresh',
+        refreshToken: tokenData.refresh_token,
       }),
     });
 
